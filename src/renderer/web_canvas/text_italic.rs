@@ -22,7 +22,7 @@ impl WebCanvasRenderer {
         let Some(selected) = selected else {
             return false;
         };
-        self.ctx.set_font(&format!(
+        self.set_font_tracked(&format!(
             "{}{}{:.3}px {}",
             if selected.slanted { "italic " } else { "" },
             if bold { "bold " } else { "" },

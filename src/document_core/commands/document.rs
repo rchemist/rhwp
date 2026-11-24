@@ -8,6 +8,17 @@ mod metafile_fonts;
 mod reflowed_table_frames;
 mod section_activation;
 
+/// `RHWP_LOAD_PROFILE=1` 일 때 문서 로드 경로의 단계별 시간을 stderr에 인쇄한다.
+/// [#doorwest-perf] 첫 화면 병목 측정용 — 워커 산출물, wasm 에서는 항상 꺼진다.
+#[cfg(not(target_arch = "wasm32"))]
+fn load_profile_enabled() -> bool {
+    std::env::var_os("RHWP_LOAD_PROFILE").is_some()
+}
+#[cfg(target_arch = "wasm32")]
+fn load_profile_enabled() -> bool {
+    false
+}
+
 use crate::document_core::validation::{
     CellPath, ValidationReport, ValidationWarning, WarningKind,
 };
@@ -228,8 +239,15 @@ impl DocumentCore {
                 .map_err(|e| HwpError::InvalidFile(format!("PDF 오류: {e}")))?;
             return Self::from_pdf_bytes(data, &options);
         }
+        let parse_started = load_profile_enabled().then(std::time::Instant::now);
         let parsed = crate::parser::parse_document_for_core(data, password)
             .map_err(|e| HwpError::InvalidFile(e.to_string()))?;
+        if let Some(started) = parse_started {
+            eprintln!(
+                "RHWP_LOAD_PROFILE parse_ms={:.1}",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         Self::from_parsed_document(parsed, source_format)
     }
 
@@ -255,6 +273,8 @@ impl DocumentCore {
         S::Error: std::fmt::Display,
     {
         let storage_error = |error| HwpError::InvalidFile(format!("PDF 오류: {error}"));
+        let load_profile = load_profile_enabled();
+        let load_t0 = load_profile.then(std::time::Instant::now);
         storage.bytes(0).map_err(storage_error)?;
         let mut document = parsed.document;
         let hml_metadata = parsed.hml_metadata;
@@ -313,6 +333,7 @@ impl DocumentCore {
         // [Task #1001] HWP3 변환본의 ParaShape 단위 1/2 추가 보정
         let activated_sections =
             section_activation::activate_page_geometry(&mut document, source_format);
+        let load_t1 = load_profile.then(std::time::Instant::now);
         let mut styles = crate::renderer::style_resolver::try_resolve_styles_for_document(
             &document,
             DEFAULT_DPI,
@@ -341,6 +362,7 @@ impl DocumentCore {
             }
         }
 
+        let load_t2 = load_profile.then(std::time::Instant::now);
         let hwp5_origin_hwpx = matches!(source_format, crate::parser::FileFormat::Hwpx)
             && document
                 .hwpx_aux_entry(crate::model::document::HWP5_ORIGIN_HWPX_MARKER_PATH)
@@ -424,6 +446,7 @@ impl DocumentCore {
         // (한컴에서 메모 추가 시 안내문 텍스트가 필드 값으로 삽입됨 — compose 전에 제거해야 정합성 유지)
         Self::clear_initial_field_texts(&mut document);
 
+        let load_t3 = load_profile.then(std::time::Instant::now);
         let sec_count = document.sections.len();
         let mut doc = DocumentCore {
             native_pua_fonts: Default::default(),
@@ -496,6 +519,7 @@ impl DocumentCore {
             validation_report,
         };
 
+        let load_t4 = load_profile.then(std::time::Instant::now);
         tac_cache_repair::repair(&mut doc.document, &doc.styles, DEFAULT_DPI);
         doc.rebuild_embedded_exact_font_sources();
         doc.repair_reparsed_split_cell_cache();
@@ -503,8 +527,10 @@ impl DocumentCore {
             .map_err(|error| {
                 HwpError::InvalidFile(format!("PDF 오류: PDF composition: {error}"))
             })?;
+        let load_t5 = load_profile.then(std::time::Instant::now);
         doc.paginate_with_storage(storage)
             .map_err(|error| HwpError::InvalidFile(format!("PDF 오류: PDF pagination: {error}")))?;
+        let load_t6 = load_profile.then(std::time::Instant::now);
 
         // [#4488/#4495] 로드 픽스업(손상 lineseg 제거·빈 문단 reflow·안내문 제거)과
         // 첫 paginate 의 materialization(그림 img_dim 등)까지 끝난 뒤 본문을 다시
@@ -516,6 +542,21 @@ impl DocumentCore {
         doc.capture_loaded_source_frames_with_storage(storage)
             .map_err(storage_error)?;
         storage.bytes(0).map_err(storage_error)?;
+        if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4), Some(t5), Some(t6)) =
+            (load_t0, load_t1, load_t2, load_t3, load_t4, load_t5, load_t6)
+        {
+            eprintln!(
+                "RHWP_LOAD_PROFILE prep_ms={:.1} styles_ms={:.1} reflow_ms={:.1} construct_ms={:.1} compose_ms={:.1} paginate_ms={:.1} post_ms={:.1} core_total_ms={:.1}",
+                (t1 - t0).as_secs_f64() * 1000.0,
+                (t2 - t1).as_secs_f64() * 1000.0,
+                (t3 - t2).as_secs_f64() * 1000.0,
+                (t4 - t3).as_secs_f64() * 1000.0,
+                (t5 - t4).as_secs_f64() * 1000.0,
+                (t6 - t5).as_secs_f64() * 1000.0,
+                t0.elapsed().as_secs_f64() * 1000.0,
+                t0.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
         Ok(doc)
     }
 

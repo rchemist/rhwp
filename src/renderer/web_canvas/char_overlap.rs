@@ -11,7 +11,7 @@ impl WebCanvasRenderer {
         let Some(plan) = crate::renderer::char_overlap::project(run, *bbox) else {
             return false;
         };
-        self.ctx.save();
+        self.save_tracked();
         if run.rotation != 0.0 {
             let (x, y) = (bbox.x + bbox.width / 2.0, bbox.y + bbox.height / 2.0);
             let _ = self.ctx.translate(x, y);
@@ -27,7 +27,7 @@ impl WebCanvasRenderer {
             }
         } else {
             let Some(document) = web_sys::window().and_then(|w| w.document()) else {
-                self.ctx.restore();
+                self.restore_tracked();
                 return false;
             };
             let Some(canvas) = document
@@ -35,7 +35,7 @@ impl WebCanvasRenderer {
                 .ok()
                 .and_then(|c| c.dyn_into::<HtmlCanvasElement>().ok())
             else {
-                self.ctx.restore();
+                self.restore_tracked();
                 return false;
             };
             let b = plan.bounds;
@@ -43,7 +43,7 @@ impl WebCanvasRenderer {
             canvas.set_width((b.width * scale).ceil() as u32 + 2);
             canvas.set_height((b.height * scale).ceil() as u32 + 2);
             let Ok(mut layer) = WebCanvasRenderer::new(&canvas) else {
-                self.ctx.restore();
+                self.restore_tracked();
                 return false;
             };
             let _ = layer.ctx.scale(scale, scale);
@@ -67,7 +67,7 @@ impl WebCanvasRenderer {
                 f64::from(canvas.height()) / scale,
             );
         }
-        self.ctx.restore();
+        self.restore_tracked();
         true
     }
 }

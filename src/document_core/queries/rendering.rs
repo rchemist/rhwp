@@ -1821,8 +1821,25 @@ impl DocumentCore {
         page_num: u32,
         profile: RenderProfile,
     ) -> Result<String, HwpError> {
+        // [#doorwest-perf] 첫 화면 병목 측정용 — 트리 생성 vs SVG 직렬화 분리 계측.
+        let timed = std::env::var_os("RHWP_LOAD_PROFILE").is_some();
+        let tree_started = timed.then(std::time::Instant::now);
         let layer_tree = self.build_page_layer_tree_with_profile(page_num, profile)?;
-        self.render_layer_tree_svg(&layer_tree)
+        if let Some(started) = tree_started {
+            eprintln!(
+                "RHWP_LOAD_PROFILE page{page_num} tree_build_ms={:.1}",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let svg_started = timed.then(std::time::Instant::now);
+        let svg = self.render_layer_tree_svg(&layer_tree)?;
+        if let Some(started) = svg_started {
+            eprintln!(
+                "RHWP_LOAD_PROFILE page{page_num} svg_render_ms={:.1}",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        Ok(svg)
     }
 
     fn render_layer_tree_svg(&self, layer_tree: &PageLayerTree) -> Result<String, HwpError> {
