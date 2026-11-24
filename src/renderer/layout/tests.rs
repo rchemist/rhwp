@@ -3485,3 +3485,33 @@ fn source_fragment_tab_record_boundaries_preserve_dynamic_stop() {
         }),
     );
 }
+
+// 저장 오른쪽 탭(채움 없음) 뒤 블록이 다음 런으로 이어질 때(`"규정\t제" | "51" | "호"`)
+// 탭 런의 전진과 글자 배치가 같은 저장 전진을 써야 다음 런 글자와 겹치지 않는다.
+#[test]
+fn stored_right_tab_continuing_block_shares_advance_with_glyphs() {
+    use super::text_measurement::{compute_char_positions, estimate_text_width_exact};
+    let mut style = TextStyle {
+        available_width: 300.0,
+        inline_tabs: vec![mk_ext(3000, 2, 0)],
+        ..mk_text_style()
+    };
+    let text = "AB\t\u{C81C}";
+    let alone = compute_char_positions(text, &style);
+    style.stored_right_tab_continues = true;
+    let positions = compute_char_positions(text, &style);
+    let advance = estimate_text_width_exact(text, &style);
+    let tail_width = positions[4] - positions[3];
+    assert!(
+        (positions[3] + tail_width - advance).abs() < 0.01,
+        "glyph end {} != advance {advance}",
+        positions[3] + tail_width
+    );
+    assert!(
+        (positions[3] - (positions[2] + 3000.0 * 96.0 / 7200.0)).abs() < 0.01,
+        "stored advance not used: {}",
+        positions[3]
+    );
+    // 블록이 런 안에서 끝나면 기존처럼 본문 우단에 맞춘다.
+    assert!((alone[4] - 300.0).abs() < 0.01, "{}", alone[4]);
+}

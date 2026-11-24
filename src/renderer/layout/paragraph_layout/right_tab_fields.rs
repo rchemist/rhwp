@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::model::control::{AutoNumberType, FieldType};
+use crate::model::paragraph::tab_ext_is_placeholder;
 use std::ops::Range;
 
 pub(super) fn tail_space(
@@ -115,4 +116,36 @@ pub(super) fn apply_block_width(
             })
             .sum::<f64>();
     style.right_tab_block_width_override = Some(width + padding);
+}
+
+/// 저장 오른쪽 탭(`ext[2]` 상위 바이트 2, 채움 없음)이 런의 유일한 탭이고, 탭 뒤
+/// 블록이 스크립트·글자 모양 경계에서 다음 런으로 이어지는지 표시한다.
+/// 이때 런 안 조각만 본문 우단에 붙이면 다음 런은 저장 전진 기준으로 시작해 겹친다.
+pub(super) fn mark_stored_right_tab_continues(
+    style: &mut TextStyle,
+    line: &ComposedLine,
+    run_index: usize,
+) {
+    style.stored_right_tab_continues = false;
+    if style.auto_tab_right {
+        return;
+    }
+    let following = &line.runs[run_index + 1..];
+    if following.is_empty() || following.iter().any(|run| run.text.contains('\t')) {
+        return;
+    }
+    if line.runs[run_index]
+        .text
+        .chars()
+        .filter(|c| *c == '\t')
+        .count()
+        != 1
+    {
+        return;
+    }
+    let Some(ext) = style.inline_tabs.first() else {
+        return;
+    };
+    style.stored_right_tab_continues =
+        !tab_ext_is_placeholder(ext) && ext[2] >> 8 == 2 && ext[2] & 0xFF == 0;
 }

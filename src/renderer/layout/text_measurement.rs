@@ -862,7 +862,7 @@ impl EmbeddedTextMeasurer {
                     // 마친 전진 거리이므로 그대로 쓰면 좌표가 재현된다
                     // (본문 좌단 75.6 + 1911HU/25.5px = 101.1 ↔ 한글 101.0).
                     // 줄 끝의 RIGHT 탭(뒤에 탭 없음)은 종전대로 우측 끝 정렬.
-                    (2, _) if has_more_tabs_after => {
+                    (2, _) if has_more_tabs_after || style.stored_right_tab_continues => {
                         x = tab_target.max(x);
                     }
                     (2, _) => {
@@ -1086,6 +1086,7 @@ fn try_char_style_to_text_style<S: crate::renderer::style_resolver::storage::Sto
             line_x_offset: 0.0,
             text_start_offset: 0.0,
             right_tab_block_width_override: None,
+            stored_right_tab_continues: false,
             tab_leaders: Vec::new(),
             inline_tabs: Vec::new(),
             extra_word_spacing: 0.0,

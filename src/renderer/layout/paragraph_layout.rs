@@ -9569,6 +9569,7 @@ impl LayoutEngine {
                 styles,
             );
             right_tab_fields::apply_block_width(&mut text_style, comp_line, run_idx, para, styles);
+            right_tab_fields::mark_stored_right_tab_continues(&mut text_style, comp_line, run_idx);
             let run_border_fill_id = styles
                 .char_styles
                 .get(run.char_style_id as usize)
@@ -11701,6 +11702,7 @@ impl LayoutEngine {
                 styles,
             );
             right_tab_fields::apply_block_width(&mut ts, comp_line, run_idx_est, para, styles);
+            right_tab_fields::mark_stored_right_tab_continues(&mut ts, comp_line, run_idx_est);
             if !remaining_est.is_empty() {
                 est_x += estimate_text_width_exact(&remaining_est, &ts);
             }
