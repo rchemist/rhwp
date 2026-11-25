@@ -283,6 +283,9 @@ pub(crate) struct MetricLookupDecision<'a> {
     pub(crate) requested_name: &'a str,
     pub(crate) alias_resolved_name: &'a str,
     pub(crate) alias_rule_id: Option<&'static str>,
+    /// resolution.alias — 요청 이름 밖의 정적 별칭이면 그 이름. [#doorwest-perf3]
+    /// 폭 결정 메모가 alias_resolved_name 의 내용을 회복할 때 쓴다.
+    pub(crate) alias_static: Option<&'static str>,
     pub(crate) metric: &'static FontMetric,
     pub(crate) bold_fallback: bool,
     pub(crate) match_kind: MetricMatchKind,
@@ -468,11 +471,78 @@ pub(crate) fn find_metric_decision<'a>(
         requested_name: name,
         alias_resolved_name,
         alias_rule_id,
+        alias_static: resolution.alias,
         metric: selected.metric,
         bold_fallback: selected.bold_fallback,
         match_kind: selected.match_kind,
         entry_index: selected.entry_index,
     })
+}
+
+/// [#doorwest-perf3] 폭 결정 메모가 보관하는 조회 조각.
+///
+/// `MetricLookupDecision` 의 이름 두 필드는 요청 문자열의 파생 조각이라 수명상 메모에
+/// 둘 수 없다. 나머지는 전부 `'static`이고, 정적 별칭이면 그 내용을 새겨 둔다. 재구성은
+/// 캡처 때와 같은 순수 문자열 변환([`strip_postscript_weight_suffix`] 포함)으로 같은
+/// 내용의 이름을 회복한다 — 소비처(font trace provenance)는 내용 비교만 한다.
+#[derive(Clone, Copy)]
+pub(crate) struct MetricDecisionMemo {
+    pub(crate) metric: &'static FontMetric,
+    pub(crate) bold_fallback: bool,
+    pub(crate) match_kind: MetricMatchKind,
+    pub(crate) entry_index: usize,
+    pub(crate) alias_rule_id: Option<&'static str>,
+    /// resolution.alias 가 요청 이름 밖의 정적 별칭이면 그 이름. None 이면
+    /// alias_resolved_name 은 lookup_name(요청 이름 또는 접미사를 뗀 family)이다.
+    pub(crate) alias_static: Option<&'static str>,
+    /// lookup_name 이 접미사를 뗀 family 이면 참(요청 이름 그대로면 거짓).
+    pub(crate) alias_was_stripped_family: bool,
+}
+
+impl MetricDecisionMemo {
+    /// 결정과 요청 이름(기본 face)으로 메모 조각을 만든다. 정적 별칭은 짧은 이름
+    /// 몇 개뿐이라 그 내용만 프로세스 수명으로 새긴다.
+    pub(crate) fn capture(decision: &MetricLookupDecision, requested_name: &str) -> Self {
+        let alias = decision.alias_resolved_name;
+        let (alias_static, alias_was_stripped_family) = if alias == requested_name {
+            (None, false)
+        } else {
+            match strip_postscript_weight_suffix(requested_name) {
+                Some((family, _)) if family == alias => (None, true),
+                _ => (Some(intern_static(alias)), false),
+            }
+        };
+        Self {
+            metric: decision.metric,
+            bold_fallback: decision.bold_fallback,
+            match_kind: decision.match_kind,
+            entry_index: decision.entry_index,
+            alias_rule_id: decision.alias_rule_id,
+            alias_static,
+            alias_was_stripped_family,
+        }
+    }
+
+    /// 캡처 때의 순수 변환을 다시 적용해 같은 내용의 결정을 재구성한다.
+    pub(crate) fn rebuild<'a>(&self, requested_name: &'a str) -> MetricLookupDecision<'a> {
+        let alias_resolved_name = match self.alias_static {
+            Some(alias) => alias,
+            None if self.alias_was_stripped_family => strip_postscript_weight_suffix(requested_name)
+                .map(|(family, _)| family)
+                .unwrap_or(requested_name),
+            None => requested_name,
+        };
+        MetricLookupDecision {
+            requested_name,
+            alias_resolved_name,
+            alias_rule_id: self.alias_rule_id,
+            alias_static: self.alias_static,
+            metric: self.metric,
+            bold_fallback: self.bold_fallback,
+            match_kind: self.match_kind,
+            entry_index: self.entry_index,
+        }
+    }
 }
 
 /// [#8079] 굵은 글자의 **조판 전진폭**을 줄 같은 family 의 보통(Regular) 표.
@@ -496,6 +566,57 @@ pub(crate) fn regular_advance_metric(bold_metric: &FontMetric) -> Option<&'stati
         && regular.metric.italic == bold_metric.italic
         && regular.metric.em_size == bold_metric.em_size)
         .then_some(regular.metric)
+}
+
+/// [#doorwest-perf3] 글자 폭 메모의 상한(항목 수). 넘치면 전부 비운다
+/// ([`crate::renderer::composer::estimate_cache`]와 같은 계약).
+pub(crate) const METRIC_MEMO_CAP: usize = 400_000;
+
+/// 표준 SipHash 는 글자마다의 조회에서 문지방이 되어 대체한 비암호 혼합기 — 히트는
+/// (글자, 플래그, 이름 내용) 검증이 뒤따르므로 해시 성질은 충돌 회피면 충분하다.
+/// [`crate::renderer::composer::estimate_cache`] 의 u64 혼합기를 빌려 쓴다.
+#[derive(Default)]
+pub(crate) struct MemoHasher(pub(crate) u64);
+
+impl std::hash::Hasher for MemoHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        crate::renderer::composer::estimate_cache::mix_bytes(&mut self.0, bytes);
+    }
+    fn write_u8(&mut self, v: u8) {
+        crate::renderer::composer::estimate_cache::mix_u64(&mut self.0, u64::from(v));
+    }
+    fn write_u32(&mut self, v: u32) {
+        crate::renderer::composer::estimate_cache::mix_u64(&mut self.0, u64::from(v));
+    }
+    fn write_u64(&mut self, v: u64) {
+        crate::renderer::composer::estimate_cache::mix_u64(&mut self.0, v);
+    }
+    fn write_usize(&mut self, v: usize) {
+        crate::renderer::composer::estimate_cache::mix_u64(&mut self.0, v as u64);
+    }
+}
+
+/// [#doorwest-perf3] 메모 항목용 문자열 인턴 — 같은 이름의 반복 [`Box::leak`] 을 한 번으로
+/// 묶는다. 글자 폭 메모는 상한에 닿으면 항목을 전부 비우지만, 빌려준 `'static` 문자열은
+/// 회수되지 않으므로 미스마다 새로 leak 하면 문서를 열 때마다 쌓인다. 글꼴·별칭 이름처럼
+/// 고유 문자열 수가 수십 개 수준이라 누수 상한이 그 수로 묶인다.
+pub(crate) fn intern_static(s: &str) -> &'static str {
+    thread_local! {
+        static INTERNED: std::cell::RefCell<std::collections::HashSet<&'static str>> =
+            std::cell::RefCell::new(std::collections::HashSet::new());
+    }
+    INTERNED.with(|set| {
+        let mut set = set.borrow_mut();
+        if let Some(existing) = set.get(s) {
+            return *existing;
+        }
+        let leaked: &'static str = Box::leak(Box::from(s));
+        set.insert(leaked);
+        leaked
+    })
 }
 
 /// 원본 프로그램에서 확인한 문자 폭은 표시 대체 글꼴의 완전한 표보다 우선한다.

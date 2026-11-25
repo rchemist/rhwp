@@ -391,6 +391,22 @@ pub(crate) fn estimate_composed_line_width_with_storage<S: crate::storage::Stora
     styles: &ResolvedStyleSet,
     storage: &S,
 ) -> Result<f64, S::Error> {
+    // [#doorwest-perf3] measure(높이 측정)와 typeset이 같은 paginate pass에서 같은
+    // `composed` 줄을 각각 재측정한다 — pass 동안만 메모해 재측정을 줄인다. 이 함수는
+    // (run 내용, styles) 만의 순수 함수라 pass 중 결과가 변하지 않는다.
+    crate::renderer::composer::estimate_cache::cached_line_width(line, styles, || -> Result<
+        f64,
+        <S as crate::storage::Storage>::Error,
+    > {
+        estimate_composed_line_width_uncached(line, styles, storage)
+    })
+}
+
+fn estimate_composed_line_width_uncached<S: crate::storage::Storage>(
+    line: &ComposedLine,
+    styles: &ResolvedStyleSet,
+    storage: &S,
+) -> Result<f64, S::Error> {
     // Retain the original sum, stopping immediately at the first storage error.
     let mut error = None;
     let width = line

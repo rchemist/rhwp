@@ -195,7 +195,64 @@ pub(crate) fn has_declared_original_glyph_metrics(face: &str) -> bool {
         )
 }
 
+/// [#doorwest-perf3] 선언 원본 전진폭 조회의 프로세스 수명 메모 — 호출자가 원/표시 두
+/// 글자로 글자마다 두 번 부르는 정적 표 선형 스캔이다. 조회 비용이 곧 이득의 상한이라
+/// 표준 SipHash 대신 비암호 혼합기(글자 폭 결정 메모와 같은 근거)를 쓰고, 히트는
+/// face 내용 검증이 뒤따른다. 항목 상한 도달 시 전부 비운다.
 pub(crate) fn declared_original_glyph_advance_em(
+    face: &str,
+    bold: bool,
+    italic: bool,
+    character: char,
+) -> Option<f64> {
+    thread_local! {
+        static DECLARED_ADVANCE_MEMO: std::cell::RefCell<
+            std::collections::HashMap<
+                u64,
+                (Option<f64>, &'static str, char, u8),
+                std::hash::BuildHasherDefault<
+                    crate::renderer::font_metrics_data::MemoHasher,
+                >,
+            >,
+        > = std::cell::RefCell::new(std::collections::HashMap::default());
+    }
+    let flags = u8::from(bold) | u8::from(italic) << 1;
+    let mut hash = 0xC0FF_EE12_3456_789Au64;
+    crate::renderer::composer::estimate_cache::mix_bytes(&mut hash, face.as_bytes());
+    crate::renderer::composer::estimate_cache::mix_u64(&mut hash, u64::from(character as u32));
+    crate::renderer::composer::estimate_cache::mix_u64(&mut hash, u64::from(flags));
+    let hit = DECLARED_ADVANCE_MEMO.with(|memo| {
+        memo.borrow()
+            .get(&hash)
+            .copied()
+            .filter(|(_, cached_face, cached_char, cached_flags)| {
+                *cached_char == character && *cached_flags == flags && *cached_face == face
+            })
+            .map(|(advance, _, _, _)| advance)
+    });
+    if let Some(advance) = hit {
+        return advance;
+    }
+    let advance = declared_original_glyph_advance_em_uncached(face, bold, italic, character);
+    DECLARED_ADVANCE_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= crate::renderer::font_metrics_data::METRIC_MEMO_CAP {
+            memo.clear();
+        }
+        memo.insert(
+            hash,
+            (
+                advance,
+                crate::renderer::font_metrics_data::intern_static(face),
+                character,
+                flags,
+            ),
+        );
+    });
+    advance
+}
+
+fn declared_original_glyph_advance_em_uncached(
     face: &str,
     bold: bool,
     italic: bool,

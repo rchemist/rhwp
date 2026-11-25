@@ -59,6 +59,7 @@ pub(crate) use stored_word_tail::{
 };
 mod note_line_slots;
 mod punctuation_slots;
+pub(crate) mod estimate_cache;
 pub(crate) use note_line_slots::NoteLineSlots;
 
 /// 글자겹침(CharOverlap) 렌더링 정보

@@ -730,6 +730,38 @@ pub(crate) fn stored_rows_are_stale_with_storage<S: crate::storage::Storage>(
     line_wrap_squeeze: bool,
     storage: &S,
 ) -> Result<bool, S::Error> {
+    // [#doorwest-perf3] measure(높이 측정)와 typeset이 같은 paginate pass에서 같은
+    // (para, composed, 폭, squeeze)로 이 판정을 반복한다 — 비용은 전부 줄 폭 재측정이다.
+    // pass 중 para_src·composed 배열은 읽기 전용(재구성은 지역 사본에서)이라 pass 내에서는
+    // 같은 주소가 같은 내용이다. 지역 사본(recompose 의 fresh_body)은 주소가 호출마다
+    // 달라질 수 있지만 저장 줄이 비어 early-return 판정이고, 판별자(line_segs·본문 바이트·
+    // 줄 수)가 다른 내용의 주소 재사용을 가린다.
+    crate::renderer::composer::estimate_cache::cached_stale_verdict(
+        composed,
+        para,
+        inner_width_px,
+        line_wrap_squeeze,
+        || -> Result<bool, <S as crate::storage::Storage>::Error> {
+            stored_rows_are_stale_uncached_with_storage(
+                composed,
+                para,
+                inner_width_px,
+                styles,
+                line_wrap_squeeze,
+                storage,
+            )
+        },
+    )
+}
+
+fn stored_rows_are_stale_uncached_with_storage<S: crate::storage::Storage>(
+    composed: &ComposedParagraph,
+    para: &Paragraph,
+    inner_width_px: f64,
+    styles: &ResolvedStyleSet,
+    line_wrap_squeeze: bool,
+    storage: &S,
+) -> Result<bool, S::Error> {
     Ok({
         if !para.line_segs.is_empty() && para.stored_text_partition_is_dirty() {
             return Ok(true);

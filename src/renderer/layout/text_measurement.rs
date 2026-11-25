@@ -1776,6 +1776,33 @@ struct EmbeddedWidthDecision<'a> {
     character_match: &'static str,
 }
 
+/// [#doorwest-perf3] 폭 결정 메모가 보관하는 산출 입력 — 히트 때 미스와 같은 수식·같은
+/// 피연산자 순서로 다시 만들어 비트까지 같은 width_px·em_fraction 을 회복한다.
+/// `quantize_hwp_px` 는 절사라 입력 1ulp 차이도 갈릴 수 있으므로 em 비율만으로 되감아
+/// 만들지 않고 갈래별 원 입력(원본 em · 표 w/em_size 짝)을 그대로 보관한다.
+#[derive(Debug, Clone, Copy)]
+enum EmbeddedEmSource {
+    /// 폭 없음(metricMiss·metricCharacterMiss).
+    Miss,
+    /// 원본·KoPub em 비율 — `quantize_hwp_px(font_size * em)`.
+    EmRatio(f64),
+    /// 임베디드 표 — `quantize_hwp_px(w * font_size / em_size)`.
+    EmbeddedTable { w: f64, em_size: f64 },
+}
+
+impl EmbeddedEmSource {
+    fn width_parts(&self, font_size: f64) -> (Option<f64>, Option<f64>) {
+        match *self {
+            Self::Miss => (None, None),
+            Self::EmRatio(em) => (Some(quantize_hwp_px(font_size * em)), Some(em)),
+            Self::EmbeddedTable { w, em_size } => (
+                Some(quantize_hwp_px(w * font_size / em_size)),
+                Some(w / em_size),
+            ),
+        }
+    }
+}
+
 fn measure_char_width_embedded_decision<'a>(
     font_family: &'a str,
     bold: bool,
@@ -1814,12 +1841,63 @@ fn css_primary_face(font_family: &str) -> &str {
         .trim_matches('"')
 }
 
-/// [#7092] `font_metric_trusted` — 메트릭 표를 그 글꼴 자신의 폭으로 믿을 수 있는지
-/// (TTF 선언 · 대체 없음). 스타일을 모르는 호출은 거짓으로 종전 측정을 따른다.
+/// [#doorwest-perf3] 임베디드 글자 폭 결정의 프로세스 수명 메모 — 상한·해시기는
+/// [`font_metrics_data`] 공용 조각을 쓴다(선언 원본 전진폭 메모와 같은 계약).
+const EMBEDDED_DECISION_MEMO_CAP: usize = font_metrics_data::METRIC_MEMO_CAP;
+
+type MemoMap = std::collections::HashMap<
+    u64,
+    CachedEmbeddedDecision,
+    std::hash::BuildHasherDefault<font_metrics_data::MemoHasher>,
+>;
+
+thread_local! {
+    static EMBEDDED_DECISION_MEMO: std::cell::RefCell<MemoMap> =
+        std::cell::RefCell::new(MemoMap::default());
+}
+
+/// 메모된 임베디드 글자 폭 결정. 이름 필드는 [`font_metrics_data::MetricDecisionMemo`]
+/// 이 재구성하고 폭은 [`EmbeddedEmSource`] 가 미스와 같은 수식으로 회복한다.
+/// 키는 u64 해시 하나라 항목이 (family 내용, 글자, 플래그)를 함께 지녀 검증한다.
+#[derive(Clone, Copy)]
+struct CachedEmbeddedDecision {
+    family: &'static str,
+    char_key: char,
+    flags: u8,
+    /// css_primary_face(font_family) 가 입력을 그대로 돌려준 단일 face 면 참 — 히트 때
+    /// 재구성에 같은 스캔을 반복하지 않는다.
+    primary_whole: bool,
+    em: EmbeddedEmSource,
+    width_source: &'static str,
+    character_match: &'static str,
+    metric: Option<font_metrics_data::MetricDecisionMemo>,
+}
+
+/// 메모 키 해시 — family 내용·글자·플래그를 한 단어로 섞는다.
+fn embedded_decision_memo_hash(font_family: &str, c: char, flags: u8) -> u64 {
+    let mut hash = 0xC0FF_EE12_3456_789Au64;
+    crate::renderer::composer::estimate_cache::mix_bytes(&mut hash, font_family.as_bytes());
+    crate::renderer::composer::estimate_cache::mix_u64(&mut hash, u64::from(c as u32));
+    crate::renderer::composer::estimate_cache::mix_u64(&mut hash, u64::from(flags));
+    hash
+}
+
+/// [#doorwest-perf3] 임베디드 글자 폭 결정의 프로세스 수명 메모.
 ///
-/// [#8079] `regular_bold_advance` — 굵은 글자의 전진폭을 같은 family 보통 표에서 읽는다.
-/// 선언 face 가 TrueType 일 때만 참이다(HFT 프로그램은 제 Bold 전진폭을 쓴다).
-/// 스타일을 모르는 호출은 거짓으로 종전 측정을 따른다.
+/// 이 함수는 (폰트 체인, 굵기·기울임·신뢰 플래그, 글자)만의 순수 함수다 — 정적 메트릭
+/// 표와 그 OnceLock 색인만 읽는다. "이름 해석은 프로세스 동안 불변"이라는 가정은
+/// `resolve_metric_name`·`KoPubFamily::from_primary` 의 최근 8개 캐시가 이미 하는
+/// 가정이다. 글자마다 그 해석 체인(문자열 비교 나열)을 반복하는 비용이 문서 생성자의
+/// 최대 몫이라 결과를 글자 키로 메모한다.
+///
+/// `font_size` 는 키에 넣지 않는다 — 결과의 크기 의존은 마지막 [`quantize_hwp_px`]
+/// 곱셈·나눗셈뿐이고, 히트 때 [`EmbeddedEmSource`] 로 미스와 같은 수식·피연산자
+/// 순서로 다시 만들면 비트까지 같다. 진단 provenance 가 읽는 `metric` 필드는
+/// [`font_metrics_data::MetricDecisionMemo`] 가 같은 내용으로 재구성한다.
+///
+/// 조회 비용이 곧 이득의 상한이다: 표준 해시기의 문자열 SipHash 는 제거한 해석 체인과
+/// 맞먹어서(초기 구현 실측) 비암호 혼합 + 히트 시 내용 검증으로 조회를 유지한다.
+/// 64비트 해시 충돌은 검증 실패로 이어져 재계산만 할 뿐 잘못된 폭을 내지 않는다.
 #[allow(clippy::too_many_arguments)]
 fn measure_char_width_embedded_decision_for_font<'a>(
     font_family: &'a str,
@@ -1831,37 +1909,128 @@ fn measure_char_width_embedded_decision_for_font<'a>(
     hft_hangul_face: bool,
     regular_bold_advance: bool,
 ) -> EmbeddedWidthDecision<'a> {
+    let flags = u8::from(bold)
+        | u8::from(italic) << 1
+        | u8::from(font_metric_trusted) << 2
+        | u8::from(hft_hangul_face) << 3
+        | u8::from(regular_bold_advance) << 4;
+    let hash = embedded_decision_memo_hash(font_family, c, flags);
+    let hit = EMBEDDED_DECISION_MEMO.with(|memo| {
+        memo.borrow().get(&hash).copied().filter(|entry| {
+            entry.char_key == c
+                && entry.flags == flags
+                && entry.family == font_family
+        })
+    });
+    if let Some(hit) = hit {
+        let primary = if hit.primary_whole {
+            font_family
+        } else {
+            css_primary_face(font_family)
+        };
+        let (width_px, em_fraction) = hit.em.width_parts(font_size);
+        return EmbeddedWidthDecision {
+            width_px,
+            em_fraction,
+            width_source: hit.width_source,
+            metric: hit.metric.map(|memo| memo.rebuild(primary)),
+            character_match: hit.character_match,
+        };
+    }
+    let (decision, em) = measure_char_width_embedded_decision_for_font_uncached(
+        font_family,
+        bold,
+        italic,
+        c,
+        font_size,
+        font_metric_trusted,
+        hft_hangul_face,
+        regular_bold_advance,
+    );
+    let primary = css_primary_face(font_family);
+    let stored = CachedEmbeddedDecision {
+        family: font_metrics_data::intern_static(font_family),
+        char_key: c,
+        flags,
+        primary_whole: {
+            let whole = primary.as_ptr() == font_family.as_ptr()
+                && primary.len() == font_family.len();
+            whole
+        },
+        em,
+        width_source: decision.width_source,
+        character_match: decision.character_match,
+        metric: decision
+            .metric
+            .map(|lookup| font_metrics_data::MetricDecisionMemo::capture(&lookup, primary)),
+    };
+    EMBEDDED_DECISION_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= EMBEDDED_DECISION_MEMO_CAP {
+            memo.clear();
+        }
+        memo.insert(hash, stored);
+    });
+    decision
+}
+
+/// [#7092] `font_metric_trusted` — 메트릭 표를 그 글꼴 자신의 폭으로 믿을 수 있는지
+/// (TTF 선언 · 대체 없음). 스타일을 모르는 호출은 거짓으로 종전 측정을 따른다.
+///
+/// [#8079] `regular_bold_advance` — 굵은 글자의 전진폭을 같은 family 보통 표에서 읽는다.
+/// 선언 face 가 TrueType 일 때만 참이다(HFT 프로그램은 제 Bold 전진폭을 쓴다).
+/// 스타일을 모르는 호출은 거짓으로 종전 측정을 따른다.
+#[allow(clippy::too_many_arguments)]
+fn measure_char_width_embedded_decision_for_font_uncached<'a>(
+    font_family: &'a str,
+    bold: bool,
+    italic: bool,
+    c: char,
+    font_size: f64,
+    font_metric_trusted: bool,
+    hft_hangul_face: bool,
+    regular_bold_advance: bool,
+) -> (EmbeddedWidthDecision<'a>, EmbeddedEmSource) {
     let primary_name = css_primary_face(font_family);
     if let Some(em) = font_metrics_data::original_glyph_advance_em(primary_name, bold, italic, c) {
-        return EmbeddedWidthDecision {
-            width_px: Some(quantize_hwp_px(font_size * em)),
-            em_fraction: Some(em),
-            width_source: "measuredOriginalGlyph",
-            metric: None,
-            character_match: "hit",
-        };
+        return (
+            EmbeddedWidthDecision {
+                width_px: Some(quantize_hwp_px(font_size * em)),
+                em_fraction: Some(em),
+                width_source: "measuredOriginalGlyph",
+                metric: None,
+                character_match: "hit",
+            },
+            EmbeddedEmSource::EmRatio(em),
+        );
     }
     if let Some(em) = kopub_char_advance_em(primary_name, bold, c) {
         // 장평·자간을 적용할 장치 격자까지 원본 em 비율을 보존한다.
         // 먼저 HU로 자르면 11pt·장평98% 등에서 한 격자를 더 잃는다.
-        return EmbeddedWidthDecision {
-            width_px: Some(quantize_hwp_px(font_size * em)),
-            em_fraction: Some(em),
-            width_source: "kopubTable",
-            metric: None,
-            character_match: "hit",
-        };
+        return (
+            EmbeddedWidthDecision {
+                width_px: Some(quantize_hwp_px(font_size * em)),
+                em_fraction: Some(em),
+                width_source: "kopubTable",
+                metric: None,
+                character_match: "hit",
+            },
+            EmbeddedEmSource::EmRatio(em),
+        );
     }
     let Some(mm) =
         font_metrics_data::find_metric_decision_for_character(primary_name, bold, italic, c)
     else {
-        return EmbeddedWidthDecision {
-            width_px: None,
-            em_fraction: None,
-            width_source: "metricMiss",
-            metric: None,
-            character_match: "notApplicable",
-        };
+        return (
+            EmbeddedWidthDecision {
+                width_px: None,
+                em_fraction: None,
+                width_source: "metricMiss",
+                metric: None,
+                character_match: "notApplicable",
+            },
+            EmbeddedEmSource::Miss,
+        );
     };
     // HWP 반각 처리: space 및 한컴이 반각으로 처리하는 구두점/기호.
     //
@@ -1884,13 +2053,16 @@ fn measure_char_width_embedded_decision_for_font<'a>(
         }
     } else {
         let Some(glyph_w) = mm.metric.get_width(c) else {
-            return EmbeddedWidthDecision {
-                width_px: None,
-                em_fraction: None,
-                width_source: "metricCharacterMiss",
-                metric: Some(mm),
-                character_match: "miss",
-            };
+            return (
+                EmbeddedWidthDecision {
+                    width_px: None,
+                    em_fraction: None,
+                    width_source: "metricCharacterMiss",
+                    metric: Some(mm),
+                    character_match: "miss",
+                },
+                EmbeddedEmSource::Miss,
+            );
         };
         // [#8079] 굵은 글자는 Bold 면으로 그리되 전진폭은 같은 family 보통 면의 값이다.
         // 보통 표에 없는 글자는 Bold 폭을 그대로 쓴다(결측을 0 폭으로 만들지 않는다).
@@ -1999,15 +2171,21 @@ fn measure_char_width_embedded_decision_for_font<'a>(
             (glyph_w, "embeddedMetric")
         }
     };
-    EmbeddedWidthDecision {
-        width_px: Some(quantize_hwp_px(
-            w as f64 * font_size / mm.metric.em_size as f64,
-        )),
-        em_fraction: Some(w as f64 / mm.metric.em_size as f64),
-        width_source,
-        metric: Some(mm),
-        character_match: "hit",
-    }
+    (
+        EmbeddedWidthDecision {
+            width_px: Some(quantize_hwp_px(
+                w as f64 * font_size / mm.metric.em_size as f64,
+            )),
+            em_fraction: Some(w as f64 / mm.metric.em_size as f64),
+            width_source,
+            metric: Some(mm),
+            character_match: "hit",
+        },
+        EmbeddedEmSource::EmbeddedTable {
+            w: f64::from(w),
+            em_size: f64::from(mm.metric.em_size),
+        },
+    )
 }
 
 pub(crate) fn char_width_decision<'a>(

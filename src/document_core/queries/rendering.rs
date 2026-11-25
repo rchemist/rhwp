@@ -5442,6 +5442,11 @@ impl DocumentCore {
         force_breaks: &[std::collections::HashSet<usize>],
         storage: &S,
     ) -> Result<(), S::Error> {
+        // [#doorwest-perf3] pass 동안 measure·typeset 의 줄 폭·부실 판정 재측정을 메모한다.
+        // scope drop(disarm·clear)이 pass 종료(정상 반환 포함)와 함께 일어나므로 pass 밖
+        // 경로는 캐시를 전혀 보지 않는다.
+        let _stale_measure_scope =
+            crate::renderer::composer::estimate_cache::PassScope::begin();
         // [#4968 R4C-3] 이번 pass의 모든 fresh-layout 경로가 동일한 exact-source
         // generation을 읽는다. 등록 source가 없으면 None으로 K0 fast path를 고정한다.
         self.ensure_exact_font_measurement_contexts();
